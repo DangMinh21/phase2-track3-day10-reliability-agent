@@ -1,0 +1,34 @@
+# Day 10 Reliability Final Report
+
+## Metrics Summary
+
+| Metric | Value |
+|---|---:|
+| total_requests | 1000 |
+| availability | 0.965 |
+| error_rate | 0.035 |
+| latency_p50_ms | 271.5 |
+| latency_p95_ms | 492.69 |
+| latency_p99_ms | 538.09 |
+| fallback_success_rate | 0.9384 |
+| cache_hit_rate | 0.15 |
+| circuit_open_count | 9 |
+| recovery_time_ms | 2219.986379146576 |
+| estimated_cost | 0.35096 |
+| estimated_cost_saved | 0.15 |
+| per_scenario | {'primary_timeout_100': {'total_requests': 200, 'availability': 0.955, 'error_rate': 0.045, 'latency_p50_ms': 301.63, 'latency_p95_ms': 508.01, 'latency_p99_ms': 542.03, 'fallback_success_rate': 0.955, 'cache_hit_rate': 0.0, 'circuit_open_count': 3, 'recovery_time_ms': None, 'estimated_cost': 0.070062, 'estimated_cost_saved': 0.0, 'scenarios': {}}, 'primary_flaky_50': {'total_requests': 200, 'availability': 0.925, 'error_rate': 0.075, 'latency_p50_ms': 294.4, 'latency_p95_ms': 514.15, 'latency_p99_ms': 540.68, 'fallback_success_rate': 0.918, 'cache_hit_rate': 0.0, 'circuit_open_count': 3, 'recovery_time_ms': 2198.3420848846436, 'estimated_cost': 0.068858, 'estimated_cost_saved': 0.0, 'scenarios': {}}, 'all_healthy': {'total_requests': 200, 'availability': 1.0, 'error_rate': 0.0, 'latency_p50_ms': 212.58, 'latency_p95_ms': 242.14, 'latency_p99_ms': 244.16, 'fallback_success_rate': 0.0, 'cache_hit_rate': 0.0, 'circuit_open_count': 0, 'recovery_time_ms': None, 'estimated_cost': 0.11378, 'estimated_cost_saved': 0.0, 'scenarios': {}}, 'cache_off': {'total_requests': 200, 'availability': 0.955, 'error_rate': 0.045, 'latency_p50_ms': 288.24, 'latency_p95_ms': 507.12, 'latency_p99_ms': 538.55, 'fallback_success_rate': 0.9408, 'cache_hit_rate': 0.0, 'circuit_open_count': 2, 'recovery_time_ms': 2241.6306734085083, 'estimated_cost': 0.076852, 'estimated_cost_saved': 0.0, 'scenarios': {}}, 'cache_on': {'total_requests': 200, 'availability': 0.99, 'error_rate': 0.01, 'latency_p50_ms': 0.31, 'latency_p95_ms': 318.72, 'latency_p99_ms': 511.38, 'fallback_success_rate': 0.9394, 'cache_hit_rate': 0.75, 'circuit_open_count': 1, 'recovery_time_ms': None, 'estimated_cost': 0.021408, 'estimated_cost_saved': 0.15, 'scenarios': {}}} |
+| cache_comparison | {'without_cache': {'latency_p50_ms': 288.24, 'latency_p95_ms': 507.12, 'estimated_cost': 0.076852, 'cache_hit_rate': 0.0, 'availability': 0.955}, 'with_cache': {'latency_p50_ms': 0.31, 'latency_p95_ms': 318.72, 'estimated_cost': 0.021408, 'cache_hit_rate': 0.75, 'availability': 0.99}, 'delta': {'latency_p50_ms': -287.93, 'latency_p95_ms': -188.4, 'estimated_cost': -0.055444, 'cache_hit_rate': 0.75}} |
+
+## Chaos Scenarios
+
+| Scenario | Status |
+|---|---|
+| primary_timeout_100 | pass |
+| primary_flaky_50 | pass |
+| all_healthy | pass |
+| cache_off | pass |
+| cache_on | pass |
+
+## Analysis TODO(student)
+
+Explain what failed, why the fallback path worked or did not work, and what you would change before production.
