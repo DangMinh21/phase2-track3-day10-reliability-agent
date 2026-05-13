@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from reliability_lab.cache import ResponseCache, SharedRedisCache
@@ -19,7 +20,14 @@ class GatewayResponse:
 
 
 class ReliabilityGateway:
-    """Routes requests through cache, circuit breakers, and fallback providers."""
+    """Routes requests through cache, circuit breakers, and fallback providers.
+
+    Route reasons emitted on GatewayResponse.route:
+        "cache_hit:<score>"     — served from cache
+        "primary:<provider>"    — served by first provider in chain
+        "fallback:<provider>"   — served by a non-first provider in chain
+        "static_fallback"       — all providers exhausted / circuits open
+    """
 
     def __init__(
         self,
@@ -32,43 +40,60 @@ class ReliabilityGateway:
         self.cache = cache
 
     def complete(self, prompt: str) -> GatewayResponse:
-        """Return a reliable response or a static fallback.
+        start = time.perf_counter()
 
-        TODO(student): Improve route reasons, cache safety checks, and error handling.
-        TODO(student): Add cost budget check — if cumulative cost exceeds a threshold,
-        skip expensive providers and route to cache or cheaper fallback.
-        """
         if self.cache is not None:
-            cached, score = self.cache.get(prompt)
+            try:
+                cached, score = self.cache.get(prompt)
+            except Exception:
+                cached, score = None, 0.0
             if cached is not None:
-                return GatewayResponse(cached, f"cache_hit:{score:.2f}", None, True, 0.0, 0.0)
+                latency_ms = (time.perf_counter() - start) * 1000
+                return GatewayResponse(
+                    text=cached,
+                    route=f"cache_hit:{score:.2f}",
+                    provider=None,
+                    cache_hit=True,
+                    latency_ms=latency_ms,
+                    estimated_cost=0.0,
+                )
 
-        last_error: str | None = None
-        for provider in self.providers:
+        errors: list[str] = []
+        for idx, provider in enumerate(self.providers):
             breaker = self.breakers[provider.name]
+            role = "primary" if idx == 0 else "fallback"
             try:
                 response: ProviderResponse = breaker.call(provider.complete, prompt)
-                if self.cache is not None:
-                    self.cache.set(prompt, response.text, {"provider": provider.name})
-                route = "primary" if provider == self.providers[0] else "fallback"
-                return GatewayResponse(
-                    text=response.text,
-                    route=route,
-                    provider=provider.name,
-                    cache_hit=False,
-                    latency_ms=response.latency_ms,
-                    estimated_cost=response.estimated_cost,
-                )
-            except (ProviderError, CircuitOpenError) as exc:
-                last_error = str(exc)
+            except CircuitOpenError:
+                errors.append(f"{provider.name}:circuit_open")
+                continue
+            except ProviderError as exc:
+                errors.append(f"{provider.name}:provider_error:{exc}")
                 continue
 
+            if self.cache is not None:
+                try:
+                    self.cache.set(prompt, response.text, {"provider": provider.name})
+                except Exception:
+                    pass
+
+            latency_ms = (time.perf_counter() - start) * 1000
+            return GatewayResponse(
+                text=response.text,
+                route=f"{role}:{provider.name}",
+                provider=provider.name,
+                cache_hit=False,
+                latency_ms=latency_ms,
+                estimated_cost=response.estimated_cost,
+            )
+
+        latency_ms = (time.perf_counter() - start) * 1000
         return GatewayResponse(
             text="The service is temporarily degraded. Please try again soon.",
             route="static_fallback",
             provider=None,
             cache_hit=False,
-            latency_ms=0.0,
+            latency_ms=latency_ms,
             estimated_cost=0.0,
-            error=last_error,
+            error="; ".join(errors) or None,
         )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -18,14 +19,15 @@ class CircuitOpenError(RuntimeError):
     """Raised when a circuit is open and calls should fail fast."""
 
 
-@dataclass(slots=True)
+@dataclass
 class CircuitBreaker:
-    """Circuit breaker skeleton.
+    """Thread-safe 3-state circuit breaker.
 
-    TODO(student): Implement a production-safe state machine:
-    - CLOSED: calls pass through; count failures.
-    - OPEN: fail fast until reset timeout elapses.
-    - HALF_OPEN: allow a probe; close on success or re-open on failure.
+    State transitions:
+        CLOSED   --(failure_count >= failure_threshold)--> OPEN
+        OPEN     --(reset_timeout elapsed, on allow_request)--> HALF_OPEN
+        HALF_OPEN --(success_count >= success_threshold)--> CLOSED
+        HALF_OPEN --(any failure)--> OPEN (immediate re-open)
     """
 
     name: str
@@ -37,22 +39,24 @@ class CircuitBreaker:
     success_count: int = 0
     opened_at: float | None = None
     transition_log: list[dict[str, str | float]] = field(default_factory=list)
+    _lock: threading.RLock = field(
+        default_factory=threading.RLock, init=False, repr=False, compare=False
+    )
 
     def allow_request(self) -> bool:
-        """Return whether a request should be attempted.
-
-        TODO(student): Return False when OPEN and timeout has not elapsed.
-        When timeout elapsed, transition to HALF_OPEN and allow one probe.
-        """
-        if self.state == CircuitState.OPEN:
-            if self.opened_at is not None and time.monotonic() - self.opened_at >= self.reset_timeout_seconds:
-                self._transition(CircuitState.HALF_OPEN, "reset_timeout_elapsed")
-                return True
-            return False
-        return True
+        with self._lock:
+            if self.state == CircuitState.OPEN:
+                if (
+                    self.opened_at is not None
+                    and time.monotonic() - self.opened_at >= self.reset_timeout_seconds
+                ):
+                    self._transition(CircuitState.HALF_OPEN, "reset_timeout_elapsed")
+                    self.success_count = 0
+                    return True
+                return False
+            return True
 
     def call(self, fn: Callable[..., T], *args: object, **kwargs: object) -> T:
-        """Call a function through the circuit breaker."""
         if not self.allow_request():
             raise CircuitOpenError(f"circuit {self.name} is open")
         try:
@@ -64,27 +68,43 @@ class CircuitBreaker:
         return result
 
     def record_success(self) -> None:
-        """Record success and close from HALF_OPEN if enough probes pass."""
-        # TODO(student): refine success threshold handling and counters.
-        self.failure_count = 0
-        self.success_count += 1
-        if self.state == CircuitState.HALF_OPEN and self.success_count >= self.success_threshold:
-            self._transition(CircuitState.CLOSED, "probe_success")
-            self.success_count = 0
+        with self._lock:
+            if self.state == CircuitState.HALF_OPEN:
+                self.success_count += 1
+                if self.success_count >= self.success_threshold:
+                    self._transition(CircuitState.CLOSED, "probe_success")
+                    self.failure_count = 0
+                    self.success_count = 0
+                    self.opened_at = None
+            else:
+                self.failure_count = 0
+                self.success_count += 1
 
     def record_failure(self) -> None:
-        """Record failure and open when threshold is reached."""
-        # TODO(student): handle HALF_OPEN failure explicitly and reset success counter.
-        self.failure_count += 1
-        self.success_count = 0
-        if self.state == CircuitState.HALF_OPEN or self.failure_count >= self.failure_threshold:
-            self._transition(CircuitState.OPEN, "failure_threshold")
-            self.opened_at = time.monotonic()
+        with self._lock:
+            self.success_count = 0
+            if self.state == CircuitState.HALF_OPEN:
+                self._transition(CircuitState.OPEN, "half_open_failure")
+                self.opened_at = time.monotonic()
+                self.failure_count = self.failure_threshold
+                return
+            self.failure_count += 1
+            if (
+                self.state == CircuitState.CLOSED
+                and self.failure_count >= self.failure_threshold
+            ):
+                self._transition(CircuitState.OPEN, "failure_threshold")
+                self.opened_at = time.monotonic()
 
     def _transition(self, new_state: CircuitState, reason: str) -> None:
         if self.state == new_state:
             return
         self.transition_log.append(
-            {"from": self.state.value, "to": new_state.value, "reason": reason, "ts": time.time()}
+            {
+                "from": self.state.value,
+                "to": new_state.value,
+                "reason": reason,
+                "ts": time.time(),
+            }
         )
         self.state = new_state
