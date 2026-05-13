@@ -158,7 +158,12 @@ class SharedRedisCache:
         self.similarity_threshold = similarity_threshold
         self.prefix = prefix
         self.false_hit_log: list[dict[str, object]] = []
-        self._redis: Any = redis_lib.Redis.from_url(redis_url, decode_responses=True)
+        self._redis: Any = redis_lib.Redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
 
     def ping(self) -> bool:
         """Check Redis connectivity."""
@@ -168,31 +173,61 @@ class SharedRedisCache:
             return False
 
     def get(self, query: str) -> tuple[str | None, float]:
-        """Look up a cached response from Redis.
+        """Look up a cached response from Redis with exact-match fast path then similarity scan.
 
-        TODO(student): Implement cache lookup.  Suggested steps:
-        1. Return (None, 0.0) if _is_uncacheable(query)
-        2. Build exact-match key: f"{self.prefix}{self._query_hash(query)}"
-        3. Try self._redis.hget(key, "response") — if found return (response, 1.0)
-        4. Otherwise self._redis.scan_iter(f"{self.prefix}*") to iterate all cached keys
-        5. For each key, HGET "query" field and compute
-           ResponseCache.similarity(query, cached_query)
-        6. Track best match that is >= self.similarity_threshold
-        7. Before returning a match, check _looks_like_false_hit(); if true,
-           append to self.false_hit_log and return (None, best_score)
+        Graceful degradation: any Redis error returns (None, 0.0) so callers treat the
+        lookup as a cache miss instead of crashing.
         """
-        return None, 0.0
+        if _is_uncacheable(query):
+            return None, 0.0
+
+        try:
+            key = f"{self.prefix}{self._query_hash(query)}"
+            exact = self._redis.hget(key, "response")
+            if exact is not None:
+                return exact, 1.0
+
+            best_response: str | None = None
+            best_query: str | None = None
+            best_score = 0.0
+            for k in self._redis.scan_iter(f"{self.prefix}*"):
+                cached_query = self._redis.hget(k, "query")
+                if cached_query is None:
+                    continue
+                score = ResponseCache.similarity(query, cached_query)
+                if score > best_score:
+                    best_score = score
+                    best_query = cached_query
+                    best_response = self._redis.hget(k, "response")
+
+            if best_response is None or best_score < self.similarity_threshold:
+                return None, best_score
+
+            if best_query is not None and _looks_like_false_hit(query, best_query):
+                self.false_hit_log.append(
+                    {
+                        "query": query,
+                        "matched_key": best_query,
+                        "score": best_score,
+                        "ts": time.time(),
+                    }
+                )
+                return None, best_score
+
+            return best_response, best_score
+        except Exception:
+            return None, 0.0
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
-        """Store a response in Redis with TTL.
-
-        TODO(student): Implement cache storage.  Suggested steps:
-        1. Return immediately if _is_uncacheable(query)
-        2. Build key: f"{self.prefix}{self._query_hash(query)}"
-        3. self._redis.hset(key, mapping={"query": query, "response": value})
-        4. self._redis.expire(key, self.ttl_seconds)
-        """
-        pass
+        """Store a response as a Redis hash with TTL. Errors are silently swallowed."""
+        if _is_uncacheable(query):
+            return
+        try:
+            key = f"{self.prefix}{self._query_hash(query)}"
+            self._redis.hset(key, mapping={"query": query, "response": value})
+            self._redis.expire(key, self.ttl_seconds)
+        except Exception:
+            pass
 
     def flush(self) -> None:
         """Remove all entries with this cache prefix (for testing)."""

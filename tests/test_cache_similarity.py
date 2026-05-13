@@ -73,3 +73,22 @@ def test_ttl_expiry() -> None:
     time.sleep(1.1)
     cached, _ = cache.get("temp query")
     assert cached is None
+
+
+def test_redis_graceful_degradation_when_unreachable() -> None:
+    """SharedRedisCache must treat connection failures as cache misses, not crashes."""
+    from reliability_lab.cache import SharedRedisCache
+
+    cache = SharedRedisCache(
+        redis_url="redis://nonexistent.invalid:6379/0",
+        ttl_seconds=60,
+        similarity_threshold=0.5,
+    )
+    # set must not raise
+    cache.set("any query", "any value")
+    # get must return graceful (None, 0.0)
+    cached, score = cache.get("any query")
+    assert cached is None
+    assert score == 0.0
+    # ping must return False without raising
+    assert cache.ping() is False
