@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from statistics import median
-from typing import Iterable
+from typing import Any, Iterable
 
 from pydantic import BaseModel, Field
 
@@ -21,6 +21,8 @@ class RunMetrics(BaseModel):
     estimated_cost_saved: float = 0.0
     latencies_ms: list[float] = Field(default_factory=list)
     scenarios: dict[str, str] = Field(default_factory=dict)
+    per_scenario: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    cache_comparison: dict[str, Any] | None = None
 
     @property
     def availability(self) -> float:
@@ -42,8 +44,8 @@ class RunMetrics(BaseModel):
     def percentile(self, q: float) -> float:
         return percentile(self.latencies_ms, q)
 
-    def to_report_dict(self) -> dict[str, object]:
-        return {
+    def to_report_dict(self) -> dict[str, Any]:
+        report: dict[str, Any] = {
             "total_requests": self.total_requests,
             "availability": round(self.availability, 4),
             "error_rate": round(self.error_rate, 4),
@@ -58,6 +60,41 @@ class RunMetrics(BaseModel):
             "estimated_cost_saved": round(self.estimated_cost_saved, 6),
             "scenarios": self.scenarios,
         }
+        if self.per_scenario:
+            report["per_scenario"] = self.per_scenario
+        if self.cache_comparison is not None:
+            report["cache_comparison"] = self.cache_comparison
+        return report
+
+    def slo_check(self, slo: dict[str, float]) -> dict[str, dict[str, Any]]:
+        """Compare metrics against SLO targets.
+
+        slo keys: availability, latency_p95_ms, fallback_success_rate,
+        cache_hit_rate, recovery_time_ms.
+        Returns a dict per SLI with target, actual, met (bool).
+        """
+        actual_by_key = {
+            "availability": self.availability,
+            "latency_p95_ms": self.percentile(95),
+            "fallback_success_rate": self.fallback_success_rate,
+            "cache_hit_rate": self.cache_hit_rate,
+            "recovery_time_ms": self.recovery_time_ms,
+        }
+        result: dict[str, dict[str, Any]] = {}
+        for key, target in slo.items():
+            actual = actual_by_key.get(key)
+            if actual is None:
+                result[key] = {"target": target, "actual": None, "met": False}
+                continue
+            # latency / recovery_time are "lower is better"
+            lower_is_better = key in {"latency_p95_ms", "recovery_time_ms"}
+            met = (actual <= target) if lower_is_better else (actual >= target)
+            result[key] = {
+                "target": target,
+                "actual": round(actual, 4),
+                "met": bool(met),
+            }
+        return result
 
     def write_json(self, path: str | Path) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)

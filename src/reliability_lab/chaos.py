@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import json
 import random
 from pathlib import Path
@@ -22,7 +21,11 @@ def load_queries(path: str | Path = "data/sample_queries.jsonl") -> list[str]:
     return queries
 
 
-def build_gateway(config: LabConfig, provider_overrides: dict[str, float] | None = None) -> ReliabilityGateway:
+def build_gateway(
+    config: LabConfig,
+    provider_overrides: dict[str, float] | None = None,
+    cache_override: bool | None = None,
+) -> ReliabilityGateway:
     providers = []
     for p in config.providers:
         fail_rate = provider_overrides.get(p.name, p.fail_rate) if provider_overrides else p.fail_rate
@@ -36,8 +39,9 @@ def build_gateway(config: LabConfig, provider_overrides: dict[str, float] | None
         )
         for p in config.providers
     }
+    cache_enabled = config.cache.enabled if cache_override is None else cache_override
     cache: ResponseCache | SharedRedisCache | None = None
-    if config.cache.enabled:
+    if cache_enabled:
         if config.cache.backend == "redis":
             cache = SharedRedisCache(
                 config.cache.redis_url,
@@ -50,17 +54,16 @@ def build_gateway(config: LabConfig, provider_overrides: dict[str, float] | None
 
 
 def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
-    """Derive recovery time from circuit breaker transition logs.
+    """Average time between circuit opening and the next CLOSED transition.
 
-    Recovery time = time between circuit opening and next successful close.
-    Returns the average recovery time across all breakers, or None if no recovery occurred.
+    Returns None if no breaker completed a full open→closed cycle.
     """
     recovery_times: list[float] = []
     for breaker in gateway.breakers.values():
         open_ts: float | None = None
         for entry in breaker.transition_log:
             if entry["to"] == "open" and open_ts is None:
-                open_ts = entry["ts"]
+                open_ts = float(entry["ts"])
             elif entry["to"] == "closed" and open_ts is not None:
                 recovery_times.append((float(entry["ts"]) - open_ts) * 1000)
                 open_ts = None
@@ -69,9 +72,17 @@ def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
     return sum(recovery_times) / len(recovery_times)
 
 
-def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig) -> RunMetrics:
-    """Run a single named chaos scenario."""
-    gateway = build_gateway(config, scenario.provider_overrides or None)
+def run_scenario(
+    config: LabConfig,
+    queries: list[str],
+    scenario: ScenarioConfig,
+) -> tuple[RunMetrics, ReliabilityGateway]:
+    """Run a single named chaos scenario and return its metrics + gateway."""
+    gateway = build_gateway(
+        config,
+        scenario.provider_overrides or None,
+        cache_override=scenario.cache_override,
+    )
     metrics = RunMetrics()
     request_count = config.load_test.requests
     for _ in range(request_count):
@@ -97,29 +108,53 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
         1 for breaker in gateway.breakers.values() for t in breaker.transition_log if t["to"] == "open"
     )
     metrics.recovery_time_ms = calculate_recovery_time_ms(gateway)
-    return metrics
+    return metrics, gateway
+
+
+def evaluate_scenario(name: str, metrics: RunMetrics) -> str:
+    """Apply per-scenario pass/fail criteria.
+
+    Falls back to "successful_requests > 0" for unknown scenarios.
+    """
+    if name == "primary_timeout_100":
+        # Primary always fails: fallback must serve nearly all traffic, primary CB must open.
+        return (
+            "pass"
+            if metrics.fallback_success_rate >= 0.9 and metrics.circuit_open_count >= 1
+            else "fail"
+        )
+    if name == "primary_flaky_50":
+        # Mixed mode: at least one primary CB cycle, both primary and fallback contribute.
+        return (
+            "pass"
+            if metrics.circuit_open_count >= 1
+            and metrics.fallback_successes > 0
+            and metrics.successful_requests > 0
+            else "fail"
+        )
+    if name == "all_healthy":
+        # Both providers healthy: no CB trips, error rate near zero.
+        return "pass" if metrics.circuit_open_count == 0 and metrics.error_rate < 0.05 else "fail"
+    if name in {"cache_off", "cache_on"}:
+        # Cache toggle scenarios just need to complete successfully.
+        return "pass" if metrics.successful_requests > 0 else "fail"
+    return "pass" if metrics.successful_requests > 0 else "fail"
 
 
 def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
-    """Run all named scenarios from config, or a default run if none defined.
-
-    TODO(student): Add a cache vs no-cache comparison scenario.
-    Extend with your own custom scenarios (e.g., cost cap near limit).
-    """
+    """Run all configured scenarios and aggregate into a single RunMetrics."""
     if not config.scenarios:
         default_scenario = ScenarioConfig(name="default", description="baseline run")
-        metrics = run_scenario(config, queries, default_scenario)
-        metrics.scenarios = {"default": "pass" if metrics.successful_requests > 0 else "fail"}
+        metrics, _ = run_scenario(config, queries, default_scenario)
+        metrics.scenarios = {"default": evaluate_scenario("default", metrics)}
+        metrics.per_scenario = {"default": metrics.to_report_dict()}
         return metrics
 
     combined = RunMetrics()
     for scenario in config.scenarios:
-        result = run_scenario(config, queries, scenario)
-
-        # TODO(student): Define pass/fail criteria per scenario.
-        # Example: primary_timeout_100 passes if fallback_success_rate > 0.9
-        passed = result.successful_requests > 0
-        combined.scenarios[scenario.name] = "pass" if passed else "fail"
+        result, _ = run_scenario(config, queries, scenario)
+        combined.scenarios[scenario.name] = evaluate_scenario(scenario.name, result)
+        combined.per_scenario[scenario.name] = result.to_report_dict()
 
         combined.total_requests += result.total_requests
         combined.successful_requests += result.successful_requests
