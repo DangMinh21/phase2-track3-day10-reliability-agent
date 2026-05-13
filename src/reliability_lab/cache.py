@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -59,42 +60,45 @@ class ResponseCache:
         self.similarity_threshold = similarity_threshold
         self._entries: list[CacheEntry] = []
         self.false_hit_log: list[dict[str, object]] = []
+        self._lock = threading.RLock()
 
     def get(self, query: str) -> tuple[str | None, float]:
         if _is_uncacheable(query):
             return None, 0.0
 
-        now = time.time()
-        self._entries = [e for e in self._entries if now - e.created_at <= self.ttl_seconds]
+        with self._lock:
+            now = time.time()
+            self._entries = [e for e in self._entries if now - e.created_at <= self.ttl_seconds]
 
-        best_entry: CacheEntry | None = None
-        best_score = 0.0
-        for entry in self._entries:
-            score = self.similarity(query, entry.key)
-            if score > best_score:
-                best_score = score
-                best_entry = entry
+            best_entry: CacheEntry | None = None
+            best_score = 0.0
+            for entry in self._entries:
+                score = self.similarity(query, entry.key)
+                if score > best_score:
+                    best_score = score
+                    best_entry = entry
 
-        if best_entry is None or best_score < self.similarity_threshold:
-            return None, best_score
+            if best_entry is None or best_score < self.similarity_threshold:
+                return None, best_score
 
-        if _looks_like_false_hit(query, best_entry.key):
-            self.false_hit_log.append(
-                {
-                    "query": query,
-                    "matched_key": best_entry.key,
-                    "score": best_score,
-                    "ts": now,
-                }
-            )
-            return None, best_score
+            if _looks_like_false_hit(query, best_entry.key):
+                self.false_hit_log.append(
+                    {
+                        "query": query,
+                        "matched_key": best_entry.key,
+                        "score": best_score,
+                        "ts": now,
+                    }
+                )
+                return None, best_score
 
-        return best_entry.value, best_score
+            return best_entry.value, best_score
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
         if _is_uncacheable(query):
             return
-        self._entries.append(CacheEntry(query, value, time.time(), metadata or {}))
+        with self._lock:
+            self._entries.append(CacheEntry(query, value, time.time(), metadata or {}))
 
     @staticmethod
     def similarity(a: str, b: str) -> float:

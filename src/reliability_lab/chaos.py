@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import random
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 from reliability_lab.cache import ResponseCache, SharedRedisCache
 from reliability_lab.circuit_breaker import CircuitBreaker
@@ -54,10 +57,6 @@ def build_gateway(
 
 
 def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
-    """Average time between circuit opening and the next CLOSED transition.
-
-    Returns None if no breaker completed a full open→closed cycle.
-    """
     recovery_times: list[float] = []
     for breaker in gateway.breakers.values():
         open_ts: float | None = None
@@ -72,22 +71,9 @@ def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
     return sum(recovery_times) / len(recovery_times)
 
 
-def run_scenario(
-    config: LabConfig,
-    queries: list[str],
-    scenario: ScenarioConfig,
-) -> tuple[RunMetrics, ReliabilityGateway]:
-    """Run a single named chaos scenario and return its metrics + gateway."""
-    gateway = build_gateway(
-        config,
-        scenario.provider_overrides or None,
-        cache_override=scenario.cache_override,
-    )
-    metrics = RunMetrics()
-    request_count = config.load_test.requests
-    for _ in range(request_count):
-        prompt = random.choice(queries)
-        result = gateway.complete(prompt)
+def _record_result(metrics: RunMetrics, result: Any, lock: threading.Lock) -> None:
+    """Thread-safe metrics update for a single gateway response."""
+    with lock:
         metrics.total_requests += 1
         metrics.estimated_cost += result.estimated_cost
         if result.cache_hit:
@@ -104,27 +90,53 @@ def run_scenario(
         if result.latency_ms:
             metrics.latencies_ms.append(result.latency_ms)
 
+
+def run_scenario(
+    config: LabConfig,
+    queries: list[str],
+    scenario: ScenarioConfig,
+) -> tuple[RunMetrics, ReliabilityGateway]:
+    """Run a single named chaos scenario sequentially or concurrently."""
+    gateway = build_gateway(
+        config,
+        scenario.provider_overrides or None,
+        cache_override=scenario.cache_override,
+    )
+    metrics = RunMetrics()
+    metrics_lock = threading.Lock()
+    request_count = config.load_test.requests
+    concurrency = max(1, config.load_test.concurrency)
+
+    def execute(_: int) -> None:
+        prompt = random.choice(queries)
+        result = gateway.complete(prompt)
+        _record_result(metrics, result, metrics_lock)
+
+    if concurrency == 1:
+        for i in range(request_count):
+            execute(i)
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            list(pool.map(execute, range(request_count)))
+
     metrics.circuit_open_count = sum(
-        1 for breaker in gateway.breakers.values() for t in breaker.transition_log if t["to"] == "open"
+        1
+        for breaker in gateway.breakers.values()
+        for t in breaker.transition_log
+        if t["to"] == "open"
     )
     metrics.recovery_time_ms = calculate_recovery_time_ms(gateway)
     return metrics, gateway
 
 
 def evaluate_scenario(name: str, metrics: RunMetrics) -> str:
-    """Apply per-scenario pass/fail criteria.
-
-    Falls back to "successful_requests > 0" for unknown scenarios.
-    """
     if name == "primary_timeout_100":
-        # Primary always fails: fallback must serve nearly all traffic, primary CB must open.
         return (
             "pass"
             if metrics.fallback_success_rate >= 0.9 and metrics.circuit_open_count >= 1
             else "fail"
         )
     if name == "primary_flaky_50":
-        # Mixed mode: at least one primary CB cycle, both primary and fallback contribute.
         return (
             "pass"
             if metrics.circuit_open_count >= 1
@@ -133,12 +145,28 @@ def evaluate_scenario(name: str, metrics: RunMetrics) -> str:
             else "fail"
         )
     if name == "all_healthy":
-        # Both providers healthy: no CB trips, error rate near zero.
         return "pass" if metrics.circuit_open_count == 0 and metrics.error_rate < 0.05 else "fail"
     if name in {"cache_off", "cache_on"}:
-        # Cache toggle scenarios just need to complete successfully.
         return "pass" if metrics.successful_requests > 0 else "fail"
     return "pass" if metrics.successful_requests > 0 else "fail"
+
+
+def _build_cache_comparison(per_scenario: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    """Build a cache vs no-cache comparison block when both scenarios are present."""
+    if "cache_off" not in per_scenario or "cache_on" not in per_scenario:
+        return None
+    off = per_scenario["cache_off"]
+    on = per_scenario["cache_on"]
+    keys = ("latency_p50_ms", "latency_p95_ms", "estimated_cost", "cache_hit_rate", "availability")
+    without = {k: off[k] for k in keys}
+    with_cache = {k: on[k] for k in keys}
+    delta = {
+        "latency_p50_ms": round(on["latency_p50_ms"] - off["latency_p50_ms"], 2),
+        "latency_p95_ms": round(on["latency_p95_ms"] - off["latency_p95_ms"], 2),
+        "estimated_cost": round(on["estimated_cost"] - off["estimated_cost"], 6),
+        "cache_hit_rate": round(on["cache_hit_rate"] - off["cache_hit_rate"], 4),
+    }
+    return {"without_cache": without, "with_cache": with_cache, "delta": delta}
 
 
 def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
@@ -172,4 +200,5 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
             else:
                 combined.recovery_time_ms = (combined.recovery_time_ms + result.recovery_time_ms) / 2
 
+    combined.cache_comparison = _build_cache_comparison(combined.per_scenario)
     return combined

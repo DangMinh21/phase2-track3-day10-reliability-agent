@@ -18,11 +18,13 @@ cache:
   similarity_threshold: 0.92
   redis_url: "redis://localhost:6379/0"
 load_test:
-  requests: 100
+  requests: 200
+  concurrency: 10          # parallel workers per scenario
 
 # Chaos scenarios.
-# CB-exercising scenarios disable cache so the circuit actually sees provider traffic;
-# otherwise repeated queries get cache_hit and never reach the breaker.
+# CB-exercising scenarios disable cache so the circuit actually sees provider traffic.
+# cache_off / cache_on pair share default provider rates so only the cache layer differs;
+# chaos.run_simulation builds a "cache_comparison" block in metrics.json from this pair.
 scenarios:
   - name: primary_timeout_100
     description: "Primary fails 100% — circuit opens, fallback serves traffic"
@@ -40,3 +42,9 @@ scenarios:
       primary: 0.0
       backup: 0.0
     cache_override: false
+  - name: cache_off
+    description: "Default providers without cache — baseline for comparison"
+    cache_override: false
+  - name: cache_on
+    description: "Default providers with in-memory cache — measures cache benefit"
+    cache_override: true
